@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import Tuple, Dict, Any, Optional
 
 from .seanet import SEANetEncoder, SEANetDecoder
+from .conv import SConv1d, SConvTranspose1d
 from .transformer import Transformer
 from .quantizer import SplitResidualVectorQuantization
 
@@ -18,7 +19,7 @@ class MimiConfig:
     dimension: int = 512
     n_filters: int = 64
     n_residual_layers: int = 1
-    ratios: Tuple[int, ...] = (8, 5, 4, 2)          # hop = 320 @ 24 kHz → 75 Hz
+    ratios: Tuple[int, ...] = (8, 6, 5, 4)
     activation: str = "ELU"
     activation_params: Dict[str, Any] = field(default_factory=lambda: {"alpha": 1.0})
     final_activation: Optional[str] = None
@@ -32,6 +33,7 @@ class MimiConfig:
     pad_mode: str = "constant" # FOR STREAMING MODE THIS MUST BE CONSTANT
     true_skip: bool = False
     compress: int = 2
+    final_downsample_stride: int = 2 # mimi adds one more 1d conv after encoder/before decoder 
     transformer_d_model: int = 512
     transformer_n_heads: int = 8
     transformer_n_layers: int = 8
@@ -57,7 +59,7 @@ class MimiModel(nn.Module):
         super().__init__()
         self.config = config
         self.accelerator = accelerator
-        self.hop_length = 1
+        self.hop_length = config.final_downsample_stride
         for r in config.ratios:
             self.hop_length *= r
 
@@ -79,6 +81,15 @@ class MimiModel(nn.Module):
             true_skip=config.true_skip,
             compress=config.compress,
             causal=True,
+        )
+
+        self.downsample = SConv1d(
+            in_channels=config.dimension, 
+            out_channels=config.dimension, 
+            kernel_size=config.final_downsample_stride * 2, # k was double the downsample stride
+            stride=config.final_downsample_stride,
+            pad_mode=config.pad_mode,
+            causal=True
         )
 
         self.encoder_transformer = Transformer(
@@ -115,6 +126,14 @@ class MimiModel(nn.Module):
             layer_scale=config.transformer_layer_scale,
         )
 
+        self.upsample = SConvTranspose1d(
+            in_channels=config.dimension, 
+            out_channels=config.dimension, 
+            kernel_size=config.final_downsample_stride * 2,  # k was double the downsample stride
+            stride=config.final_downsample_stride,
+            causal=True
+        )
+
         self.decoder = SEANetDecoder(
             channels=config.channels,
             dimension=config.dimension,
@@ -149,21 +168,23 @@ class MimiModel(nn.Module):
         """
         stack = ExitStack()
         stack.enter_context(self.encoder.streaming(batch_size))
+        stack.enter_context(self.downsample.streaming(batch_size))
         stack.enter_context(self.encoder_transformer.streaming(batch_size))
         stack.enter_context(self.decoder_transformer.streaming(batch_size))
+        stack.enter_context(self.upsample.streaming(batch_size))
         stack.enter_context(self.decoder.streaming(batch_size))
         return stack
 
     def _encode_to_latent(self, x: torch.Tensor) -> torch.Tensor:
-        """audio (B,C,T) → latent (B, dimension, T//hop)"""
         z = self.encoder(x)                          # (B, D, T//hop)
+        z = self.downsample(z)
         z = z.permute(0, 2, 1)                       # (B, T//hop, D) for transformer
         z = self.encoder_transformer(z)
         z = z.permute(0, 2, 1)                       # (B, D, T//hop)
         return z
 
     def _decode_from_latent(self, z: torch.Tensor) -> torch.Tensor:
-        """latent (B, dimension, L) → audio (B, C, L*hop)"""
+        z = self.upsample(z)
         z = z.permute(0, 2, 1)                       # (B, L, D)
         z = self.decoder_transformer(z)
         z = z.permute(0, 2, 1)                       # (B, D, L)
@@ -183,7 +204,7 @@ class MimiModel(nn.Module):
 
         # Encode
         z = self._encode_to_latent(x)           # (B, D, L)
-
+        
         # Variable-codebook training: randomly drop quantizers
         n_q_semantic = self.config.num_semantic_quantizers
         n_q_acoustic = torch.tensor(
@@ -211,11 +232,11 @@ class MimiModel(nn.Module):
         distill_loss  = quant_out["distillation_loss"]
 
         return {
-            "decoded":          decoded,
-            "encoder_out":      z,
-            "quantized":        quant_out["hidden_states"],
-            "semantic_loss":    semantic_loss,
-            "acoustic_loss":    acoustic_loss,
+            "decoded": decoded,
+            "encoder_out": z,
+            "quantized": quant_out["hidden_states"],
+            "semantic_loss": semantic_loss,
+            "acoustic_loss": acoustic_loss,
             "distillation_loss": distill_loss,
             "total_quant_loss": semantic_loss + acoustic_loss + distill_loss,
             # keep full quant dict for logging
@@ -288,6 +309,7 @@ class MimiModel(nn.Module):
 if __name__ == "__main__":
     import torch
     from contextlib import ExitStack
+    from tqdm import tqdm
 
     torch.manual_seed(42)
     device = "cuda" if torch.cuda.is_available() else "cpu"
@@ -296,7 +318,7 @@ if __name__ == "__main__":
         dimension=64,
         n_filters=16,
         n_residual_layers=1,
-        ratios=[4, 2],           # hop = 8, fast to iterate
+        ratios=[8, 6, 5, 4],         
         transformer_d_model=64,
         transformer_n_heads=4,
         transformer_n_layers=2,
@@ -316,24 +338,35 @@ if __name__ == "__main__":
     model.eval()
 
     B  = 2
-    T  = 2048
-    hop = model.hop_length  # 8
-
+    T  = 24000 * 8 + 12345
+    hop = model.hop_length # 8
+    
+    ### create data 
     x = torch.randn(B, 1, T, device=device, dtype=torch.float64)
+
+    ### Pad to complete hop 
+    leftover = T % hop
+    if leftover:
+        pad_len = hop - leftover
+        x_padded = torch.nn.functional.pad(x, (0, pad_len))
+    else:
+        x_padded = x
+
+    ### Normal forward pass
     with torch.no_grad():
-        tokens_full = model.encode(x)      
+        tokens_full = model.encode(x_padded)      
         audio_full = model.decode(tokens_full)
 
+    ### Chunked forward pass 
     token_chunks = []
     audio_chunks = []
-
     with model.streaming(B):
         with torch.no_grad():
-            for i in range(0, x.shape[-1], hop):
-                chunk_norm = x[:, :, i:i + hop]
+            for i in tqdm(range(0, x.shape[-1], hop)):
+                chunk = x_padded[:, :, i:i + hop]
 
-                z = model._encode_to_latent(chunk_norm)          # (B, D, 1)
-                tok_c = model.quantizer.encode(z)                # (nq, B, 1)
+                z = model._encode_to_latent(chunk) # (B, D, 1)
+                tok_c = model.quantizer.encode(z) # (nq, B, 1)
 
                 aud_c = model.decode(tok_c)
 
@@ -345,9 +378,8 @@ if __name__ == "__main__":
 
 
     tokens_match = (tokens_full == tokens_stream).all().item()
-
     audio_err = (audio_full - audio_stream).abs().max().item()
     audio_ok = audio_err < 1e-5
-
-    print(tokens_match)
+    
     print(audio_err)
+    print(tokens_match)

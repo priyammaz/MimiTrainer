@@ -95,7 +95,7 @@ class SEANetEncoder(nn.Module):
                  dilation_base=2, 
                  pad_mode="constant", 
                  true_skip=False, 
-                 compress=2):
+                 compress=2): # mimi has the final conv with an extra stride of 2
 
         super().__init__()
         
@@ -104,6 +104,7 @@ class SEANetEncoder(nn.Module):
         self.n_filters = n_filters
         self.ratios = list(reversed(ratios))
         self.n_residual_layers = n_residual_layers
+
         self.hop_length = np.prod(self.ratios)
 
         ### Get activation function 
@@ -150,7 +151,7 @@ class SEANetEncoder(nn.Module):
         ### Post process with a final convolution ###
         model += [
             act(**activation_params) if activation != "Snake" else act(mult * n_filters),
-            SConv1d(mult * n_filters, dimension, last_kernel_size, 
+            SConv1d(mult * n_filters, dimension, last_kernel_size,
                     norm=norm, norm_kwargs=norm_params, causal=causal,
                     pad_mode=pad_mode)
         ]
@@ -162,7 +163,7 @@ class SEANetEncoder(nn.Module):
     
     def forward(self, x):
         return self.model(x)
-
+    
 class SEANetDecoder(nn.Module):
     def __init__(self, 
                  channels=1, 
@@ -199,7 +200,7 @@ class SEANetDecoder(nn.Module):
 
         ### This will basically be opposite of the Encoder 
         model = [
-            SConv1d(dimension, mult * n_filters, kernel_size, 
+            SConv1d(dimension, mult * n_filters, kernel_size,
                     norm=norm, norm_kwargs=norm_params, causal=causal,
                     pad_mode=pad_mode)
         ]
@@ -301,7 +302,7 @@ if __name__ == "__main__":
 
         # frame_size: the encoder consumes hop_length samples per latent frame.
         # We chunk the input at this granularity so each chunk produces exactly
-        # one latent frame — the same invariant used in the conv-level test.
+        # one latent frame the same invariant used in the conv-level test.
         frame_size = hop_length
 
         # Pad T to a multiple of frame_size so full-sequence and streaming
